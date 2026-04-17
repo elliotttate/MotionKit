@@ -1,0 +1,36 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.dylib
+
+# Swift / Xcode
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# macOS
+.DS_Store
+
+# IDA Pro decompile output (large; reproducible from tools/)
+motion_ida_decompile_*/
+
+# Swift package builds (parakeet-transcriber etc. are 500MB+ binaries)
+tools/parakeet-transcriber
+tools/parakeet-transcriber/
+
+# Editor / agent scratch
+.playwright-mcp/
+.claude/
+*.swp
+*.swo
+
+# Logs
+*.log
