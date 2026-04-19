@@ -2,7 +2,7 @@
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
   <channel>
     <title>SpliceKit Motion</title>
-    <link>https://raw.githubusercontent.com/elliotttate/MotionKit/main/appcast.xml</link>
+    <link>https://raw.githubusercontent.com/elliotttate/SpliceKitMotion/main/appcast.xml</link>
     <description>Most recent releases of SpliceKit Motion</description>
     <language>en</language>
   </channel>
