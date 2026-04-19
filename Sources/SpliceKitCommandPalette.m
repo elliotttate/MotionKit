@@ -13,6 +13,7 @@
 //
 
 #import "SpliceKitCommandPalette.h"
+#import "SpliceKitBridgeAPI.h"
 #import "SpliceKit.h"
 #import <AppKit/AppKit.h>
 #import <objc/runtime.h>
@@ -981,7 +982,22 @@ static BOOL SpliceKitMotionCommandIsBlocked(NSString *selectorName, NSString *co
         }
         return YES;
     }
+    // Runtime-added entries from palette.block RPC (persists across restarts).
+    NSString *runtimeReason = nil;
+    if (SpliceKitBridge_isBlockedSelector(selectorName, &runtimeReason)) {
+        if (reasonOut) {
+            *reasonOut = runtimeReason ?: @"Blocked via palette.block RPC.";
+        }
+        return YES;
+    }
     return NO;
+}
+
+// Public extern — lets SpliceKitBridgeAPI.m answer palette.isBlocked with
+// the full combined verdict (hardcoded + runtime) instead of just runtime.
+BOOL SpliceKitPalette_isBlockedSelector(NSString *selector, NSString **reasonOut) {
+    if (!selector.length) return NO;
+    return SpliceKitMotionCommandIsBlocked(selector, nil, reasonOut);
 }
 
 - (SpliceKitCommand *)motionCommandForIdentifier:(NSString *)identifier
@@ -2456,6 +2472,66 @@ static BOOL SpliceKitMotionCommandIsBlocked(NSString *selectorName, NSString *co
     }
     [self hidePalette];
     [self executeCommand:cmd.action type:cmd.type];
+}
+
+// Dry-run path: resolve the command, return what executeCommand would do
+// without actually firing sendAction:. Used by agents/scripts to probe
+// selectors safely before executing them.
+- (NSDictionary *)previewCommand:(NSString *)action type:(NSString *)type {
+    if ([type isEqualToString:@"motion_command"]) {
+        NSArray<SpliceKitCommand *> *ambiguous = nil;
+        SpliceKitCommand *cmd = [self motionCommandForIdentifier:action ambiguous:&ambiguous];
+        if (!cmd) {
+            return @{
+                @"dryRun": @YES,
+                @"resolved": @NO,
+                @"ambiguousCount": @(ambiguous.count),
+                @"error": [NSString stringWithFormat:@"No Motion command matches %@",
+                              action ?: @"<unknown>"],
+            };
+        }
+        NSString *selectorName = cmd.bridgeSelector ?: action;
+        NSString *blockReason = nil;
+        BOOL blocked = SpliceKitMotionCommandIsBlocked(selectorName, cmd.action, &blockReason);
+        __block NSString *targetClass = nil;
+        __block BOOL validatedYes = YES;
+        SpliceKit_executeCocoaUIBlock(^{
+            id app = ((id (*)(id, SEL))objc_msgSend)(
+                objc_getClass("NSApplication"), @selector(sharedApplication));
+            SEL sel = NSSelectorFromString(selectorName);
+            id target = nil;
+            if ([app respondsToSelector:@selector(targetForAction:)]) {
+                target = ((id (*)(id, SEL, SEL))objc_msgSend)(
+                    app, @selector(targetForAction:), sel);
+            }
+            if (target) targetClass = NSStringFromClass([target class]);
+            NSMenuItem *sender = [[NSMenuItem alloc] initWithTitle:cmd.action ?: selectorName
+                                                             action:sel keyEquivalent:@""];
+            if (target && [target respondsToSelector:@selector(validateMenuItem:)]) {
+                validatedYes = ((BOOL (*)(id, SEL, id))objc_msgSend)(
+                    target, @selector(validateMenuItem:), sender);
+            }
+        }, 0.5, @"command.execute.dryRun");
+        NSMutableDictionary *out = [@{
+            @"dryRun": @YES,
+            @"resolved": @YES,
+            @"command": cmd.action ?: @"",
+            @"selector": selectorName,
+            @"blocked": @(blocked),
+            @"validateMenuItem": @(validatedYes),
+            @"targetClass": targetClass ?: [NSNull null],
+            @"wouldDispatch": @(!blocked && validatedYes),
+        } mutableCopy];
+        if (blockReason) out[@"blockReason"] = blockReason;
+        return out;
+    }
+    // Non-motion types don't have the same preflight model.
+    return @{
+        @"dryRun": @YES,
+        @"type": type ?: @"",
+        @"action": action ?: @"",
+        @"note": @"dryRun is currently only implemented for motion_command",
+    };
 }
 
 - (NSDictionary *)executeCommand:(NSString *)action type:(NSString *)type {

@@ -66,6 +66,11 @@ typedef NS_ENUM(NSInteger, SpliceKitCommandCategory) {
 // Execute a command by action name
 - (NSDictionary *)executeCommand:(NSString *)action type:(NSString *)type;
 
+// Dry-run: resolve the command, run preflight (targetForAction +
+// validateMenuItem) and report what would happen WITHOUT actually firing.
+// Used by agents/scripts to probe selectors safely.
+- (NSDictionary *)previewCommand:(NSString *)action type:(NSString *)type;
+
 // Search commands
 - (NSArray<SpliceKitCommand *> *)searchCommands:(NSString *)query;
 

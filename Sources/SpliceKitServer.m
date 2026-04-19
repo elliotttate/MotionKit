@@ -20,6 +20,7 @@
 #import "SpliceKitCommandPalette.h"
 #import "SpliceKitDebugUI.h"
 #import "SpliceKitLua.h"
+#import "SpliceKitBridgeAPI.h"
 #import <sys/socket.h>
 #import <sys/un.h>
 #import <sys/stat.h>
@@ -10683,6 +10684,10 @@ static NSDictionary *SpliceKit_handleCommandExecute(NSDictionary *params) {
     if (type.length == 0) {
         type = SpliceKit_isMotionHost() ? @"motion_command" : @"timeline";
     }
+    BOOL dryRun = [params[@"dryRun"] boolValue];
+    if (dryRun) {
+        return [[SpliceKitCommandPalette sharedPalette] previewCommand:action type:type];
+    }
     return [[SpliceKitCommandPalette sharedPalette] executeCommand:action type:type];
 }
 
@@ -18030,6 +18035,7 @@ static NSDictionary *SpliceKit_handleDebugBreakpoint(NSDictionary *params) {
 NSDictionary *SpliceKit_handleRequest(NSDictionary *request) {
     NSString *method = request[@"method"];
     NSDictionary *params = request[@"params"] ?: @{};
+    NSDate *_skReqStart = [NSDate date];
 
     if (!method) {
         return @{@"error": @{@"code": @(-32600), @"message": @"Invalid Request: method required"}};
@@ -18458,10 +18464,60 @@ NSDictionary *SpliceKit_handleRequest(NSDictionary *request) {
     } else if ([method isEqualToString:@"lua.watch"]) {
         result = SpliceKit_handleLuaWatch(params);
     }
+    // bridge.* self-introspection + new ergonomics RPCs
+    else if ([method isEqualToString:@"bridge.alive"]) {
+        result = SpliceKit_handleBridgeAlive(params);
+    } else if ([method isEqualToString:@"bridge.describe"]) {
+        result = SpliceKit_handleBridgeDescribe(params);
+    } else if ([method isEqualToString:@"bridge.metrics"]) {
+        result = SpliceKit_handleBridgeMetrics(params);
+    } else if ([method isEqualToString:@"bridge.resetMetrics"]) {
+        result = SpliceKit_handleBridgeResetMetrics(params);
+    }
+    // palette.* runtime blocklist
+    else if ([method isEqualToString:@"palette.block"]) {
+        result = SpliceKit_handlePaletteBlock(params);
+    } else if ([method isEqualToString:@"palette.unblock"]) {
+        result = SpliceKit_handlePaletteUnblock(params);
+    } else if ([method isEqualToString:@"palette.listBlocked"]) {
+        result = SpliceKit_handlePaletteListBlocked(params);
+    } else if ([method isEqualToString:@"palette.isBlocked"]) {
+        result = SpliceKit_handlePaletteIsBlocked(params);
+    }
+    // Crash + log retrieval
+    else if ([method isEqualToString:@"debug.lastCrash"]) {
+        result = SpliceKit_handleDebugLastCrash(params);
+    } else if ([method isEqualToString:@"debug.mainThreadBacktrace"]) {
+        result = SpliceKit_handleDebugMainThreadBacktrace(params);
+    } else if ([method isEqualToString:@"log.tail"]) {
+        result = SpliceKit_handleLogTail(params);
+    } else if ([method isEqualToString:@"log.path"]) {
+        result = SpliceKit_handleLogPath(params);
+    }
+    // Modal handling
+    else if ([method isEqualToString:@"window.listModals"]) {
+        result = SpliceKit_handleWindowListModals(params);
+    } else if ([method isEqualToString:@"modal.dismiss"]) {
+        result = SpliceKit_handleModalDismiss(params);
+    }
+    // Batch + session
+    else if ([method isEqualToString:@"batch.execute"]) {
+        result = SpliceKit_handleBatchExecute(params);
+    } else if ([method isEqualToString:@"session.snapshot"]) {
+        result = SpliceKit_handleSessionSnapshot(params);
+    } else if ([method isEqualToString:@"session.restore"]) {
+        result = SpliceKit_handleSessionRestore(params);
+    }
     else {
+        double _skElapsed = [[NSDate date] timeIntervalSinceDate:_skReqStart] * 1000.0;
+        SpliceKit_metricsRecord(method, _skElapsed, NO);
         return @{@"error": @{@"code": @(-32601), @"message":
                      [NSString stringWithFormat:@"Method not found: %@", method]}};
     }
+
+    double _skElapsedOk = [[NSDate date] timeIntervalSinceDate:_skReqStart] * 1000.0;
+    BOOL _skOk = !result[@"error"];
+    SpliceKit_metricsRecord(method, _skElapsedOk, _skOk);
 
     if (result[@"error"] && ![result[@"error"] isKindOfClass:[NSDictionary class]]) {
         return @{@"error": @{@"code": @(-32000), @"message": result[@"error"]}};
