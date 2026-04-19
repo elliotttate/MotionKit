@@ -30,7 +30,8 @@ NSDictionary *SpliceKit_handleDebugLastCrash(NSDictionary *params);
 NSDictionary *SpliceKit_handleLogTail(NSDictionary *params);
 NSDictionary *SpliceKit_handleLogPath(NSDictionary *params);
 
-// Modal window handling
+// Modal / window handling
+NSDictionary *SpliceKit_handleWindowList(NSDictionary *params);
 NSDictionary *SpliceKit_handleWindowListModals(NSDictionary *params);
 NSDictionary *SpliceKit_handleModalDismiss(NSDictionary *params);
 

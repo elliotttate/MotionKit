@@ -963,6 +963,10 @@ static BOOL SpliceKitMotionCommandIsBlocked(NSString *selectorName, NSString *co
             @"removeOpticalFlowCache:",
             // Opens macOS Help Viewer which pops an unwanted window.
             @"showHelp:",
+            // pasteAsPlainText: fired via sendAction: tripped a
+            // pointer-auth fault inside Motion's edit-tool snap timer
+            // (_snapTimer: → endSnapping) during harness runs.
+            @"pasteAsPlainText:",
         ]];
     });
     if ([blockedDocumentCreationSelectors containsObject:selectorName]) {

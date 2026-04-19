@@ -1580,15 +1580,117 @@ static void SpliceKit_bypassMotionPrivacyGateIfPossible(void) {
 // the project browser dialog, which is what Motion would do organically
 // once a logged-in subscribed user finished onboarding.
 static void SpliceKit_motionSkipOnboardingFlow(id self, SEL _cmd) {
-    // No-op override for POFDesktopOnboardingCoordinator.runFlow. Motion's
-    // default post-onboarding behaviour is to open the Project Browser modal,
-    // which blocks automation and is confusing on every launch. We skip both
-    // the onboarding flow AND the browser — the app becomes immediately
-    // responsive with no document open. Users can open a project via
-    // File > Open from the menu bar after launch completes.
-    (void)self;
-    (void)_cmd;
-    SpliceKit_log(@"[Motion] runFlow intercepted — skipping onboarding (no auto-open)");
+    // runFlow override for POFDesktopOnboardingCoordinator.
+    //
+    // Motion's real onboarding wizard eventually calls
+    // -[MGApplicationController appLaunched:] when the user finishes it.
+    // That call is what populates the full File/Edit/Mark/Object/View/…
+    // menu bar (Motion stashes the XIB's menu items in
+    // _appStartupMainMenuItemsBackup at launch and only restores them in
+    // appLaunched:). If we short-circuit runFlow without firing
+    // appLaunched:, the user is stuck with only the "Motion" app menu.
+    //
+    // So: skip the onboarding UI, *then* call appLaunched:, *then* open the
+    // Project Browser so the user has a window to pick a project from.
+    SpliceKit_log(@"[Motion] runFlow intercepted — skipping onboarding, "
+                  @"firing appLaunched:, opening project browser");
+
+    Class appCtlClass = objc_getClass("MGApplicationController");
+    if (appCtlClass) {
+        Class appClass = objc_getClass("NSApplication");
+        id nsApp = appClass ? ((id (*)(id, SEL))objc_msgSend)(
+            appClass, @selector(sharedApplication)) : nil;
+        id appCtl = nil;
+        if (nsApp && [nsApp respondsToSelector:@selector(delegate)]) {
+            appCtl = ((id (*)(id, SEL))objc_msgSend)(nsApp, @selector(delegate));
+            if (![appCtl isKindOfClass:appCtlClass]) appCtl = nil;
+        }
+        SEL appLaunchedSel = NSSelectorFromString(@"appLaunched:");
+        if (appCtl && [appCtl respondsToSelector:appLaunchedSel]) {
+            @try {
+                ((void (*)(id, SEL, id))objc_msgSend)(appCtl, appLaunchedSel, nsApp);
+                SpliceKit_log(@"[Motion] Fired -[MGApplicationController appLaunched:]");
+            } @catch (NSException *exception) {
+                SpliceKit_log(@"[Motion] appLaunched: threw %@",
+                              exception.reason ?: exception.name);
+            }
+        }
+
+        // Manually restore the File/Edit/Mark/… menus from the backup ivar.
+        // Motion stashes the XIB's menu items in
+        // -[MGApplicationController _appStartupMainMenuItemsBackup] at launch
+        // and normally only restores them at the END of its onboarding +
+        // splash + license chain. We short-circuit that chain with this
+        // runFlow override, so we have to re-splice the backup ourselves —
+        // otherwise users get stuck with a menu bar containing only the
+        // "Motion" app menu.
+        if (appCtl) {
+            @try {
+                NSArray *backup = [appCtl valueForKey:@"_appStartupMainMenuItemsBackup"];
+                NSMenu *mainMenu = ((NSMenu *(*)(id, SEL))objc_msgSend)(
+                    nsApp, @selector(mainMenu));
+                if (backup.count > 0 && mainMenu) {
+                    NSUInteger added = 0;
+                    for (NSMenuItem *item in backup) {
+                        if (![item isKindOfClass:[NSMenuItem class]]) continue;
+                        // Respect identity: don't duplicate items that are
+                        // already in the main menu (the "Motion" app menu
+                        // and anything we've installed ourselves).
+                        if ([mainMenu indexOfItem:item] != -1) continue;
+                        if (item.title.length
+                            && [mainMenu indexOfItemWithTitle:item.title] != -1) continue;
+                        [mainMenu addItem:item];
+                        added += 1;
+                    }
+                    SpliceKit_log(@"[Motion] Restored %lu main-menu items from "
+                                  @"_appStartupMainMenuItemsBackup (now %ld total)",
+                                  (unsigned long)added, (long)mainMenu.numberOfItems);
+                } else {
+                    SpliceKit_log(@"[Motion] No menu backup to restore (count=%lu, mainMenu=%@)",
+                                  (unsigned long)backup.count,
+                                  mainMenu ? @"present" : @"nil");
+                }
+            } @catch (NSException *exception) {
+                SpliceKit_log(@"[Motion] Menu restore threw %@",
+                              exception.reason ?: exception.name);
+            }
+        }
+    }
+
+    Class controllerClass = objc_getClass("MGDocumentController");
+    if (!controllerClass) {
+        SpliceKit_log(@"[Motion] MGDocumentController not available — cannot open browser");
+        return;
+    }
+    id controller = ((id (*)(id, SEL))objc_msgSend)(
+        controllerClass, @selector(sharedDocumentController));
+    if (!controller) {
+        SpliceKit_log(@"[Motion] sharedDocumentController returned nil");
+        return;
+    }
+
+    SEL dictSel = NSSelectorFromString(@"dictionaryForDefaultDocument");
+    SEL openSel = NSSelectorFromString(@"newDocumentFromProjectBrowser:");
+    id payload = nil;
+    if ([controller respondsToSelector:dictSel]) {
+        @try {
+            payload = ((id (*)(id, SEL))objc_msgSend)(controller, dictSel);
+        } @catch (NSException *exception) {
+            SpliceKit_log(@"[Motion] dictionaryForDefaultDocument threw %@",
+                          exception.reason ?: exception.name);
+        }
+    }
+    if (![controller respondsToSelector:openSel]) {
+        SpliceKit_log(@"[Motion] newDocumentFromProjectBrowser: not available");
+        return;
+    }
+    @try {
+        ((void (*)(id, SEL, id))objc_msgSend)(controller, openSel, payload);
+        SpliceKit_log(@"[Motion] Triggered newDocumentFromProjectBrowser:");
+    } @catch (NSException *exception) {
+        SpliceKit_log(@"[Motion] newDocumentFromProjectBrowser: threw %@",
+                      exception.reason ?: exception.name);
+    }
 }
 
 static BOOL sMotionOnboardingFlowBypassed = NO;

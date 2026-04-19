@@ -388,13 +388,37 @@ static BOOL SpliceKitBridge_windowLooksModal(NSWindow *w) {
     if (!w || !w.isVisible) return NO;
     if ([NSApp modalWindow] == w) return YES;
     NSWindowLevel level = w.level;
-    // Sheets and floating dialogs live above the base level.
     if (w.sheet) return YES;
     if (level == NSModalPanelWindowLevel) return YES;
-    // NSOpenPanel / NSSavePanel typically report windowClass NSSavePanel.
     NSString *cls = NSStringFromClass([w class]);
+    // NSOpenPanel / NSSavePanel
     if ([cls containsString:@"SavePanel"] || [cls containsString:@"OpenPanel"]) return YES;
+    // Motion's Project Browser + similar launcher / settings dialogs render
+    // inside LKKeyablePanel (a Helium subclass). Treat any LKKeyablePanel /
+    // NSPanel subclass that's explicitly modal-looking as a dismissible
+    // modal.
+    if ([cls containsString:@"KeyablePanel"]) return YES;
+    // Title heuristic: explicit launcher / browser / onboarding windows.
+    NSString *title = (w.title ?: @"").lowercaseString;
+    if ([title containsString:@"project browser"] ||
+        [title containsString:@"welcome"] ||
+        [title containsString:@"onboarding"] ||
+        [title containsString:@"tip of the day"]) return YES;
     return NO;
+}
+
+static NSDictionary *SpliceKitBridge_describeWindow(NSWindow *w, NSInteger idx) {
+    return @{
+        @"index": @(idx),
+        @"windowNumber": @(w.windowNumber),
+        @"title": w.title ?: @"",
+        @"className": NSStringFromClass([w class]) ?: @"?",
+        @"isVisible": @(w.isVisible),
+        @"isSheet": @(w.sheet ? YES : NO),
+        @"isKey": @(w.isKeyWindow),
+        @"isAppModal": @([NSApp modalWindow] == w),
+        @"level": @(w.level),
+    };
 }
 
 static NSArray *SpliceKitBridge_listModalsOnMain(void) {
@@ -402,34 +426,90 @@ static NSArray *SpliceKitBridge_listModalsOnMain(void) {
     NSInteger idx = 0;
     for (NSWindow *w in [NSApp windows]) {
         if (!SpliceKitBridge_windowLooksModal(w)) continue;
-        NSString *title = w.title ?: @"";
-        [out addObject:@{
-            @"index": @(idx),
-            @"windowNumber": @(w.windowNumber),
-            @"title": title,
-            @"className": NSStringFromClass([w class]),
-            @"isSheet": @(w.sheet ? YES : NO),
-            @"isKey": @(w.isKeyWindow),
-            @"level": @(w.level),
-            @"isAppModal": @([NSApp modalWindow] == w),
-        }];
+        [out addObject:SpliceKitBridge_describeWindow(w, idx)];
         idx += 1;
     }
     return out;
+}
+
+static NSArray *SpliceKitBridge_listAllWindowsOnMain(void) {
+    NSMutableArray *out = [NSMutableArray array];
+    NSInteger idx = 0;
+    for (NSWindow *w in [NSApp windows]) {
+        [out addObject:SpliceKitBridge_describeWindow(w, idx)];
+        idx += 1;
+    }
+    return out;
+}
+
+NSDictionary *SpliceKit_handleWindowList(__unused NSDictionary *params) {
+    __block NSArray *result = nil;
+    BOOL ok = SpliceKit_executeCocoaUIBlock(^{
+        result = SpliceKitBridge_listAllWindowsOnMain();
+    }, 0.5, @"window.list");
+    if (ok) return @{@"windows": result ?: @[], @"source": @"main"};
+    // Off-thread fallback
+    @try {
+        NSMutableArray *out = [NSMutableArray array];
+        NSArray *windows = [NSApp valueForKey:@"windows"];
+        NSInteger idx = 0;
+        for (NSWindow *w in windows) {
+            [out addObject:SpliceKitBridge_describeWindow(w, idx)];
+            idx += 1;
+        }
+        return @{@"windows": out, @"source": @"fallback-offthread"};
+    } @catch (NSException *e) {
+        return @{@"error": [NSString stringWithFormat:
+                  @"main thread blocked AND off-thread read failed: %@",
+                  e.reason ?: @"unknown"]};
+    }
 }
 
 NSDictionary *SpliceKit_handleWindowListModals(__unused NSDictionary *params) {
     __block NSArray *result = nil;
     BOOL ok = SpliceKit_executeCocoaUIBlock(^{
         result = SpliceKitBridge_listModalsOnMain();
-    }, 1.0, @"window.listModals");
-    if (!ok) return @{@"error": @"main thread unavailable for window enumeration"};
-    return @{@"modals": result ?: @[]};
+    }, 0.5, @"window.listModals");
+    if (ok) return @{@"modals": result ?: @[], @"source": @"main"};
+
+    @try {
+        NSMutableArray *out = [NSMutableArray array];
+        NSArray *windows = [NSApp valueForKey:@"windows"];
+        NSInteger idx = 0;
+        for (NSWindow *w in windows) {
+            if (!SpliceKitBridge_windowLooksModal(w)) continue;
+            [out addObject:SpliceKitBridge_describeWindow(w, idx)];
+            idx += 1;
+        }
+        return @{@"modals": out, @"source": @"fallback-offthread"};
+    } @catch (NSException *e) {
+        return @{@"error": [NSString stringWithFormat:
+                     @"main thread blocked AND off-thread read failed: %@",
+                     e.reason ?: @"unknown"]};
+    }
 }
 
 NSDictionary *SpliceKit_handleModalDismiss(NSDictionary *params) {
     NSInteger index = [params[@"index"] isKindOfClass:[NSNumber class]]
         ? [params[@"index"] integerValue] : -1;
+    NSString *titleMatch = [params[@"title"] isKindOfClass:[NSString class]]
+        ? params[@"title"] : nil;
+    BOOL emergency = [params[@"emergency"] boolValue];
+
+    // Emergency path: main thread is blocked by a nested modal loop. Call
+    // [NSApp abortModal] off-thread to break out. This is documented as
+    // safe to call from background threads.
+    if (emergency) {
+        @try {
+            [NSApp performSelectorOnMainThread:@selector(abortModal)
+                                    withObject:nil waitUntilDone:NO];
+            return @{@"dismissed": @YES, @"mode": @"emergency-abortModal"};
+        } @catch (NSException *e) {
+            return @{@"dismissed": @NO,
+                     @"reason": e.reason ?: @"abortModal failed"};
+        }
+    }
+
     __block NSDictionary *result = nil;
     BOOL ok = SpliceKit_executeCocoaUIBlock(^{
         NSArray *modals = SpliceKitBridge_listModalsOnMain();
@@ -437,8 +517,26 @@ NSDictionary *SpliceKit_handleModalDismiss(NSDictionary *params) {
             result = @{@"dismissed": @NO, @"reason": @"no modal windows visible"};
             return;
         }
-        // Default: dismiss the top-most modal (the last one, which is key).
-        NSInteger targetIdx = index >= 0 ? index : (NSInteger)modals.count - 1;
+        NSInteger targetIdx = -1;
+        if (titleMatch.length > 0) {
+            for (NSInteger i = 0; i < (NSInteger)modals.count; i++) {
+                NSString *title = modals[i][@"title"];
+                if ([title.lowercaseString containsString:titleMatch.lowercaseString]) {
+                    targetIdx = i;
+                    break;
+                }
+            }
+            if (targetIdx < 0) {
+                result = @{@"dismissed": @NO,
+                           @"reason": [NSString stringWithFormat:
+                                       @"no visible modal title matches '%@'", titleMatch]};
+                return;
+            }
+        } else if (index >= 0) {
+            targetIdx = index;
+        } else {
+            targetIdx = (NSInteger)modals.count - 1; // top-most
+        }
         if (targetIdx >= (NSInteger)modals.count) {
             result = @{@"dismissed": @NO, @"reason":
                        [NSString stringWithFormat:@"index %ld out of range (%lu modals)",

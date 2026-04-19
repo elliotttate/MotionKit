@@ -255,8 +255,20 @@ static id SpliceKitLua_toObjC(lua_State *L, int idx) {
             if (lua_isinteger(L, idx))
                 return @(lua_tointeger(L, idx));
             return @(lua_tonumber(L, idx));
-        case LUA_TSTRING:
-            return @(lua_tostring(L, idx));
+        case LUA_TSTRING: {
+            size_t slen = 0;
+            const char *s = lua_tolstring(L, idx, &slen);
+            if (!s) return @"";
+            NSString *ns = [[NSString alloc] initWithBytes:s length:slen
+                                                  encoding:NSUTF8StringEncoding];
+            if (!ns) {
+                // Fall back to latin1 so we never return nil (which would
+                // crash an NSDictionary/NSArray literal construction).
+                ns = [[NSString alloc] initWithBytes:s length:slen
+                                            encoding:NSISOLatin1StringEncoding];
+            }
+            return ns ?: @"<invalid utf-8>";
+        }
         case LUA_TTABLE:
             if (SpliceKitLua_isSequence(L, idx))
                 return SpliceKitLua_toNSArray(L, idx);

@@ -17227,19 +17227,21 @@ static NSDictionary *SpliceKit_handleDebugEval(NSDictionary *params) {
                         [steps addObject:@{@"step": step, @"result": @"nil"}];
                         break;
                     }
-                    SEL sel = NSSelectorFromString(step);
-                    if (![obj respondsToSelector:sel]) {
-                        // Try KVC
-                        @try {
-                            obj = [obj valueForKey:step];
-                        } @catch (NSException *e) {
-                            [steps addObject:@{@"step": step, @"error": e.reason ?: @"KVC failed"}];
-                            obj = nil;
-                            break;
-                        }
-                    } else {
-                        obj = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+                    // Use KVC exclusively. Calling objc_msgSend() directly for
+                    // selectors that return primitives (NSInteger, BOOL,
+                    // CGFloat, struct) mis-reads the return as an id pointer
+                    // and segfaults the next step — KVC wraps primitives in
+                    // NSNumber so the walk is always safe.
+                    id nextObj = nil;
+                    @try {
+                        nextObj = [obj valueForKey:step];
+                    } @catch (NSException *e) {
+                        [steps addObject:@{@"step": step,
+                                           @"error": e.reason ?: @"KVC failed"}];
+                        obj = nil;
+                        break;
                     }
+                    obj = nextObj;
                     NSString *desc = obj ? SpliceKit_safeDescription(obj, 500) : @"nil";
                     [steps addObject:@{
                         @"step": step,
@@ -17308,20 +17310,23 @@ static NSDictionary *SpliceKit_handleDebugEval(NSDictionary *params) {
                 return;
             }
 
-            // Walk remaining chain
+            // Walk remaining chain via KVC. Calling objc_msgSend() blindly
+            // for selectors that return primitives (NSInteger, BOOL, CGFloat,
+            // struct) mis-reads the return as an id pointer and segfaults
+            // the next step. KVC wraps primitives in NSNumber so the walk
+            // is always safe.
             for (NSUInteger i = 1; i < parts.count; i++) {
                 NSString *prop = parts[i];
                 if (!obj) { result = @{@"error": [NSString stringWithFormat:@"nil at step %@", prop]}; return; }
 
-                SEL sel = NSSelectorFromString(prop);
-                if ([obj respondsToSelector:sel]) {
-                    obj = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
-                } else {
-                    @try { obj = [obj valueForKey:prop]; }
-                    @catch (NSException *e) {
-                        result = @{@"error": [NSString stringWithFormat:@"%@ does not respond to %@", NSStringFromClass([obj class]), prop]};
-                        return;
-                    }
+                @try {
+                    obj = [obj valueForKey:prop];
+                } @catch (NSException *e) {
+                    result = @{@"error": [NSString stringWithFormat:
+                                @"%@ does not respond to %@ (%@)",
+                                NSStringFromClass([obj class]), prop,
+                                e.reason ?: @"KVC failed"]};
+                    return;
                 }
             }
 
@@ -18032,9 +18037,43 @@ static NSDictionary *SpliceKit_handleDebugBreakpoint(NSDictionary *params) {
 // works fine. The string comparisons are fast enough — we're not doing thousands per second.
 //
 
+// Remove NSNull values and recurse into nested collections. JSON `null` comes
+// through as NSNull, and code across 200+ handlers assumes e.g.
+// `NSString *x = params[@"x"]` is either nil or a string. NSNull would
+// pretend to be both until a selector is called, then crash with
+// "unrecognized selector sent to instance" (abort → SIGABRT). Scrubbing
+// here fixes the whole surface at once.
+static id SpliceKit_scrubParams(id value) {
+    if (!value || value == [NSNull null]) return nil;
+    if ([value isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *out = [NSMutableDictionary dictionaryWithCapacity:
+                                    ((NSDictionary *)value).count];
+        for (id key in (NSDictionary *)value) {
+            id scrubbed = SpliceKit_scrubParams(((NSDictionary *)value)[key]);
+            if (scrubbed) out[key] = scrubbed;
+        }
+        return out;
+    }
+    if ([value isKindOfClass:[NSArray class]]) {
+        NSMutableArray *out = [NSMutableArray arrayWithCapacity:
+                               ((NSArray *)value).count];
+        for (id item in (NSArray *)value) {
+            id scrubbed = SpliceKit_scrubParams(item);
+            [out addObject:scrubbed ?: [NSNull null]];
+        }
+        return out;
+    }
+    return value;
+}
+
 NSDictionary *SpliceKit_handleRequest(NSDictionary *request) {
-    NSString *method = request[@"method"];
-    NSDictionary *params = request[@"params"] ?: @{};
+    NSString *method = [request[@"method"] isKindOfClass:[NSString class]]
+        ? request[@"method"] : nil;
+    id rawParams = request[@"params"];
+    NSDictionary *params = @{};
+    if ([rawParams isKindOfClass:[NSDictionary class]]) {
+        params = (NSDictionary *)SpliceKit_scrubParams(rawParams) ?: @{};
+    }
     NSDate *_skReqStart = [NSDate date];
 
     if (!method) {
@@ -18495,7 +18534,9 @@ NSDictionary *SpliceKit_handleRequest(NSDictionary *request) {
         result = SpliceKit_handleLogPath(params);
     }
     // Modal handling
-    else if ([method isEqualToString:@"window.listModals"]) {
+    else if ([method isEqualToString:@"window.list"]) {
+        result = SpliceKit_handleWindowList(params);
+    } else if ([method isEqualToString:@"window.listModals"]) {
         result = SpliceKit_handleWindowListModals(params);
     } else if ([method isEqualToString:@"modal.dismiss"]) {
         result = SpliceKit_handleModalDismiss(params);
